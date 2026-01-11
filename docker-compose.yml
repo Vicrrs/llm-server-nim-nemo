@@ -1,0 +1,56 @@
+services:
+  # ====== BACKEND: OLLAMA (container) ======
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    network_mode: host
+    volumes:
+      - ollama_data:/root/.ollama
+
+  # ====== INIT: BAIXA MODELOS NO VOLUME ======
+  ollama-init:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    network_mode: host
+    depends_on:
+      - ollama
+    environment:
+      - OLLAMA_HOST=http://127.0.0.1:11434
+      - OLLAMA_MODELS=${OLLAMA_MODELS:-deepseek-r1:8b}
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./scripts/ollama_init.sh:/ollama_init.sh:ro
+    entrypoint: ["/bin/sh", "/ollama_init.sh"]
+    restart: "no"
+
+  # ====== BACKEND: NIM (opcional) ======
+  nim:
+    profiles: ["nim"]
+    image: nvcr.io/nim/mistral/mistral-7b-instruct-v0.2:latest
+    runtime: nvidia
+    network_mode: host
+    environment:
+      - NGC_API_KEY=${NGC_API_KEY}
+      - NIM_MAX_MODEL_LEN=2048
+      - NIM_ENABLE_TENSORRT_LLM=0
+      - NIM_LLM_ENGINE=vllm
+      - NIM_PRECISION=fp16
+    shm_size: "16gb"
+    volumes:
+      - nim_cache:/opt/nim/.cache
+
+  # ====== GATEWAY ======
+  gateway:
+    build: ./gateway
+    network_mode: host
+    environment:
+      - API_KEY=${API_KEY}
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+      - NIM_BASE_URL=${NIM_BASE_URL:-http://127.0.0.1:8000/v1}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-deepseek-r1:8b}
+      - LLM_TIMEOUT=${LLM_TIMEOUT:-120.0}
+
+volumes:
+  nim_cache:
+  ollama_data:
