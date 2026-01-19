@@ -27,17 +27,111 @@ services:
   nim:
     profiles: ["nim"]
     image: nvcr.io/nim/mistral/mistral-7b-instruct-v0.2:latest
-    runtime: nvidia
     network_mode: host
+    gpus: all
     environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - NGC_API_KEY=${NGC_API_KEY}
       - NIM_MAX_MODEL_LEN=2048
       - NIM_ENABLE_TENSORRT_LLM=0
       - NIM_LLM_ENGINE=vllm
       - NIM_PRECISION=fp16
     shm_size: "16gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
     volumes:
       - nim_cache:/opt/nim/.cache
+
+  # ====== TENSORRT-LLM INIT (builda engine) ======
+  trtllm-init:
+    profiles: ["trtllm"]
+    image: nvcr.io/nvidia/tensorrt-llm/release:latest
+    network_mode: host
+    ipc: host
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+      - HF_TOKEN=${HF_TOKEN:-}
+      - TRTLLM_MODEL=${TRTLLM_MODEL:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}
+      - TRTLLM_ENGINE_NAME=${TRTLLM_ENGINE_NAME:-tinyllama-1.1b-chat}
+
+      # ====== TUNING PRA 4050 / ~6GiB ======
+      - TRTLLM_MAX_BATCH_SIZE=1
+      - TRTLLM_MAX_INPUT_LEN=256
+      - TRTLLM_MAX_SEQ_LEN=512
+
+      # reduz custo do build
+      - TRTLLM_FAST_BUILD=1
+      - TRTLLM_WORKERS=1
+
+      # desliga features que aumentam memória
+      - TRTLLM_DISABLE_FP8=1
+      - TRTLLM_PAGED_KV_CACHE=0
+      - TRTLLM_REMOVE_INPUT_PADDING=0
+
+    shm_size: "16gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+    volumes:
+      - trtllm_engines:/trt_engines
+      - trtllm_work:/work
+      - ./scripts/trtllm_init.sh:/trtllm_init.sh:ro
+    entrypoint: ["/bin/bash", "-lc", "/trtllm_init.sh"]
+    restart: "no"
+
+  # ====== TENSORRT-LLM SERVER (só sobe quando engine existir) ======
+  trtllm:
+    profiles: ["trtllm"]
+    image: nvcr.io/nvidia/tensorrt-llm/release:latest
+    network_mode: host
+    ipc: host
+    depends_on:
+      - trtllm-init
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - TRTLLM_ENGINE_ROOT=/trt_engines
+      - TRTLLM_ENGINE_NAME=${TRTLLM_ENGINE_NAME:-tinyllama-1.1b-chat}
+
+      # ====== runtime limits (precisa bater com o build_config) ======
+      - TRTLLM_SERVE_MAX_BATCH_SIZE=${TRTLLM_SERVE_MAX_BATCH_SIZE:-1}
+      - TRTLLM_SERVE_MAX_NUM_TOKENS=${TRTLLM_SERVE_MAX_NUM_TOKENS:-512}
+      - TRTLLM_SERVE_MAX_SEQ_LEN=${TRTLLM_SERVE_MAX_SEQ_LEN:-512}
+      - TRTLLM_SERVE_PORT=${TRTLLM_SERVE_PORT:-8001}
+
+    shm_size: "16gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+    volumes:
+      - trtllm_engines:/trt_engines
+
+    command: >
+      bash -lc '
+        set -e;
+        ENGINE_DIR="/trt_engines/$$TRTLLM_ENGINE_NAME";
+        echo "[trtllm] waiting for engine at $$ENGINE_DIR ...";
+        while [ ! -d "$$ENGINE_DIR" ] || [ -z "$$(ls -A "$$ENGINE_DIR" 2>/dev/null)" ]; do
+          sleep 2;
+        done;
+        echo "[trtllm] engine found. starting server...";
+        trtllm-serve serve "$$ENGINE_DIR" \
+          --backend trt \
+          --host 0.0.0.0 \
+          --port "$$TRTLLM_SERVE_PORT" \
+          --max_batch_size "$$TRTLLM_SERVE_MAX_BATCH_SIZE" \
+          --max_num_tokens "$$TRTLLM_SERVE_MAX_NUM_TOKENS" \
+          --max_seq_len "$$TRTLLM_SERVE_MAX_SEQ_LEN"
+      '
+    restart: unless-stopped
 
   # ====== GATEWAY ======
   gateway:
@@ -48,9 +142,25 @@ services:
       - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
       - NIM_BASE_URL=${NIM_BASE_URL:-http://127.0.0.1:8000/v1}
+      - TRTLLM_BASE_URL=${TRTLLM_BASE_URL:-http://127.0.0.1:8001/v1}
+      - TRTLLM_ENGINE_DIR=/trt_engines
       - DEFAULT_MODEL=${DEFAULT_MODEL:-deepseek-r1:8b}
       - LLM_TIMEOUT=${LLM_TIMEOUT:-120.0}
+    volumes:
+      - trtllm_engines:/trt_engines
+
+  # ====== UI ======
+  ui:
+    build: ./gateway/ui
+    network_mode: host
+    environment:
+      - GATEWAY_URL=http://127.0.0.1:8080
+      - API_KEY=${API_KEY}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-deepseek-r1:8b}
+      - TIMEOUT=${LLM_TIMEOUT:-120.0}
 
 volumes:
   nim_cache:
   ollama_data:
+  trtllm_engines:
+  trtllm_work:
